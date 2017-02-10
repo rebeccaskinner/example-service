@@ -3,7 +3,8 @@ CFLAGS= -o0 \
 	-Wall \
 	-Wextra \
 	-Werror \
-	-g -ggdb
+	-g -ggdb \
+	-DDEBUG
 
 CC= gcc
 
@@ -18,5 +19,6 @@ service: service.o
 clean:
 	-rm -f *.o
 	-rm -f service
+	-rm -f core
 
 .PHONY: clean all

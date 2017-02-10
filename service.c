@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#include <stddef.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
@@ -22,8 +23,17 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <sys/signalfd.h>
+#include <signal.h>
+#include <sys/epoll.h>
+#include <stdarg.h>
+#include <time.h>
 
+const int EPOLL_EVENT_CNT = 10;
 const char PID_PATH[] = "/var/run/example-service.pid";
+const char SRV_SOCK_PATH[] = "/tmp/example-service.socket";
 
 struct service_opts;
 typedef struct service_opts service_opts_t;
@@ -32,6 +42,14 @@ int parse_int(char* input, time_t* output);
 int handle_args(int argc, char** argv, service_opts_t* opts);
 FILE* open_logfile(char* path);
 int check_pidfile();
+int handle_reload(service_opts_t*);
+int open_uds_socket_srv(const char* path, FILE*);
+int get_signal_fd(FILE*);
+int add_fd_to_epoll(int epollfd, int fd);
+int handle_socket_fd(int socketfd, FILE* logfile);
+int handle_signal_fd(int signalfd, FILE* logfile);
+void printlog(FILE* logfile, const char* fmt, ...);
+void write_pidfile();
 
 #ifdef DEBUG
 void show_service_opts(service_opts_t* s);
@@ -45,20 +63,260 @@ struct service_opts {
     char* log_to;
     FILE* log_fd;
     int nofork;
+    int reload_config;
 };
 
 int main(int argc, char **argv) {
     service_opts_t opts = {};
+    int listen_fd;
+    int signal_fd;
+    int epollfd;
+    int num_fds;
+    pid_t child_pid;
+
+    struct epoll_event events[EPOLL_EVENT_CNT];
     if (-1 == handle_args(argc, argv, &opts)) {
         showHelp();
         return EXIT_FAILURE;
+    }
+
+    if (NULL == opts.log_fd) {
+        opts.log_fd = stderr;
     }
 
     #ifdef DEBUG
     show_service_opts(&opts);
     #endif
 
+    if (opts.reload_config) {
+        return handle_reload(&opts);
+    }
+
+    if (-1 == (listen_fd = open_uds_socket_srv(SRV_SOCK_PATH, opts.log_fd))) {
+        printlog(opts.log_fd, "cannot open unix socket at '%s'\n", SRV_SOCK_PATH);
+        return -1;
+    }
+
+    if (-1 == (signal_fd = get_signal_fd(opts.log_fd))) {
+        return -1;
+    }
+
+    if(-1 == (epollfd = epoll_create1(0))) {
+        printlog(opts.log_fd, "unable to epoll: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if(-1 == add_fd_to_epoll(epollfd, listen_fd)) {
+        printlog(opts.log_fd, "unable to add fd to epoll: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if(-1 == add_fd_to_epoll(epollfd, signal_fd)) {
+        printlog(opts.log_fd, "unable to add fd to epoll: %s\n", strerror(errno));
+        return -1;
+    }
+
+    switch (child_pid = fork()) {
+    case -1:
+        printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
+        break;
+    case 0:
+        printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
+        break;
+    default:
+        exit(0);
+        break;
+    }
+
+    write_pidfile();
+
+    for(;;) {
+        if(-1 == (num_fds = epoll_wait(epollfd, events, EPOLL_EVENT_CNT, -1))) {
+            printlog(opts.log_fd, "epoll_wait error: %s\n", strerror(errno));
+        }
+        for(int i = 0; i < num_fds; i++) {
+            if (events[i].data.fd == listen_fd) {
+                if(handle_socket_fd(listen_fd, opts.log_fd)) { goto finish; }
+            }
+
+            if (events[i].data.fd == signal_fd) {
+                if(handle_signal_fd(signal_fd, opts.log_fd)) { goto finish; }
+            }
+
+        }
+    }
+finish:
+    if(opts.log_fd) {
+        fflush(opts.log_fd);
+        fclose(opts.log_fd);
+    }
+    if(0 < epollfd) { close(epollfd); }
+    if(0 < signal_fd) { close(signal_fd); }
+    if(0 < listen_fd) { close(listen_fd); }
+    return 0;
 }
+
+void printlog(FILE* logfile, const char* fmt, ...) {
+    if (NULL == logfile) {
+        logfile = stderr;
+    }
+    va_list ap;
+    va_start (ap, fmt);
+    fprintf(logfile, "[%lu] ", time(NULL));
+    vfprintf(logfile, fmt, ap);
+    #ifdef DEBUG
+    if (logfile != stderr && logfile != stdout) {
+        fprintf(stderr, "[%lu] ", time(NULL));
+        vfprintf(stderr, fmt, ap);
+    }
+    #endif
+    va_end (ap);
+}
+
+int handle_socket_fd(int socketfd, FILE* logfile) {
+    return 0;
+}
+
+int handle_signal_fd(int signalfd, FILE* logfile) {
+    ssize_t s;
+    struct signalfd_siginfo fdsi;
+    if(-1 == (s = read(signalfd, &fdsi, sizeof(struct signalfd_siginfo)))) {
+        printlog(logfile, "error reading from signal fd: %s\n", strerror(errno));
+        return -1;
+    }
+    switch(fdsi.ssi_signo) {
+    case SIGHUP:
+        printlog(logfile, "received SIGHUP\n");
+        break;
+    case SIGINT:
+        printlog(logfile, "received SIGINT\n");
+        return -1;
+        break;
+    case SIGQUIT:
+        printlog(logfile, "received SIGQUIT\n");
+        break;
+    case SIGILL:
+        printlog(logfile, "received SIGILL\n");
+        break;
+    case SIGABRT:
+        printlog(logfile, "received SIGABRT\n");
+        break;
+    case SIGFPE:
+        printlog(logfile, "received SIGFPE\n");
+        break;
+    case SIGSEGV:
+        printlog(logfile, "received SIGSEGV\n");
+        break;
+    case SIGPIPE:
+        printlog(logfile, "received SIGPIPE\n");
+        break;
+    case SIGALRM:
+        printlog(logfile, "received SIGHALRM\n");
+        break;
+    case SIGTERM:
+        printlog(logfile, "received SIGTERM\n");
+        break;
+    case SIGUSR1:
+        printlog(logfile, "received SIGUSR1\n");
+        break;
+    case SIGUSR2:
+        printlog(logfile, "received SIGUSR2\n");
+        break;
+    case SIGCHLD:
+        printlog(logfile, "received SIGCHLD\n");
+    default:
+        printlog(logfile, "received unknown signal: %d\n", fdsi.ssi_signo);
+        break;
+    }
+    return 0;
+}
+
+int add_fd_to_epoll(int epollfd, int fd) {
+    struct epoll_event ev;
+    if (epollfd < 0 || fd < 0) { return -1; }
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    return epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+int get_signal_fd(FILE* logfd) {
+    sigset_t sigmask;
+    int signal_fd;
+
+    sigemptyset(&sigmask);
+    sigaddset(&sigmask, SIGHUP);
+    sigaddset(&sigmask, SIGINT);
+    sigaddset(&sigmask, SIGQUIT);
+    sigaddset(&sigmask, SIGILL);
+    sigaddset(&sigmask, SIGABRT);
+    sigaddset(&sigmask, SIGFPE);
+    sigaddset(&sigmask, SIGSEGV);
+    sigaddset(&sigmask, SIGPIPE);
+    sigaddset(&sigmask, SIGALRM);
+    sigaddset(&sigmask, SIGTERM);
+    sigaddset(&sigmask, SIGUSR1);
+    sigaddset(&sigmask, SIGUSR2);
+    sigaddset(&sigmask, SIGCHLD);
+
+    if(sigprocmask(SIG_BLOCK, &sigmask, NULL)) {
+        printlog(logfd, "error masking signals: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (-1 == (signal_fd = signalfd(-1, &sigmask, SFD_NONBLOCK))) {
+        printlog(logfd, "error creating signal fd: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return signal_fd;
+}
+
+int handle_reload(__attribute__((unused)) service_opts_t* opts) {
+    return 0;
+}
+
+// Creates and binds to a unix domain socket
+int open_uds_socket_srv(const char* path, FILE* logfd) {
+    int fd;
+    socklen_t size;
+    struct sockaddr_un sa;
+
+    if (unlink(path)) {
+        if (ENOENT != errno) {
+            printlog(logfd, "unable to remove socket at '%s': %s\n", SRV_SOCK_PATH, strerror(errno));
+            return -1;
+        }
+    }
+
+
+    if (-1 == (fd = socket(PF_LOCAL, SOCK_DGRAM, 0))) {
+        printlog(logfd, "error getting socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&sa, 0, sizeof(struct sockaddr_un));
+    sa.sun_family = AF_LOCAL;
+    strncpy(sa.sun_path, path, sizeof(sa.sun_path));
+    sa.sun_path[sizeof(sa.sun_path) - 1] = '\0';
+
+    size = (offsetof (struct sockaddr_un, sun_path) + strlen(sa.sun_path));
+    if (bind(fd, (struct sockaddr*)&sa, size)) {
+        printlog(logfd, "unable to bind to socket: %s\n", strerror(errno));
+        goto error;
+    }
+
+    return 0;
+error:
+    if(fd > 0) {
+        close(fd);
+    }
+    return -1;
+}
+
+// Connects to a unix domain socket
+// int open_uds_socket_cli(char* path) {
+//    return -1;
+// }
 
 // check_pidfile attempts to determine if an instance of the process
 // is already running.  It returns -1 if it believes a process is
@@ -85,7 +343,7 @@ int check_pidfile() {
 
     pidfile_contents = malloc(st.st_size);
     if (NULL == (f = fopen(PID_PATH, "r"))) {
-        fprintf(stderr, "Error opening pidfile: %s\n", strerror(errno));
+        printlog(stderr, "Error opening pidfile: %s\n", strerror(errno));
         goto cleanup;
     }
 
@@ -97,6 +355,14 @@ cleanup:
     if (NULL != pidfile_contents) {
     }
     return rv;
+}
+
+void write_pidfile() {
+    if(-1 == unlink(PID_PATH)) {
+        if (ENOENT != errno) {
+            exit(-1);
+        }
+    }
 }
 
 void showHelp() {
@@ -116,6 +382,8 @@ void showHelp() {
     fprintf(stderr, "\t                     \t /var/log/example-service/service.log\n");
     fprintf(stderr,"\n");
     fprintf(stderr, "\t --foreground        \t If --foreground is set the do not daemonize\n");
+    fprintf(stderr,"\n");
+    fprintf(stderr, "\t --reload            \t Tell running instance of the service to reload it's config\n");
     fprintf(stderr,"\n");
     fprintf(stderr, "\t --help              \t show this help message and exit\n");
 }
@@ -137,10 +405,11 @@ int handle_args(int argc, char** argv, service_opts_t *opts) {
         {"log-to", required_argument, 0, 'c'},
         {"foreground", no_argument, &foreground_flag, 1},
         {"help", no_argument, 0, 'h'},
+        {"reload",no_argument,0,'r'},
         {},
     };
 
-    while (-1 != (c = getopt_long(argc, argv, "a:b:c:", allowed_opts, &opt_idx))) {
+    while (-1 != (c = getopt_long(argc, argv, "a:b:c:hr", allowed_opts, &opt_idx))) {
         switch (c) {
         case 'a':
             if (NULL == optarg) {
@@ -176,6 +445,9 @@ int handle_args(int argc, char** argv, service_opts_t *opts) {
                 goto error;
             }
             break;
+        case 'r':
+            opts->reload_config = 1;
+            return 0;
         case 'h':
         default:
             goto error;
@@ -225,6 +497,10 @@ void show_service_opts(service_opts_t* opts) {
         printf("configured options: NULL\n");
         return;
     }
+    if (opts->reload_config) {
+        printf("reloading config\n");
+        return;
+    }
     printf("configured options:\n");
     printf("\t Timeout after: ");
     if (opts->timeout_after) {
@@ -238,5 +514,10 @@ void show_service_opts(service_opts_t* opts) {
     if (opts->log_to && opts->log_fd) {
         printf("%s (%d)\n", opts->log_to, fileno(opts->log_fd));
     } else { printf("unknown\n"); }
+    if (opts->nofork) {
+        printf("running in foreground\n");
+    } else {
+        printf("running in background\n");
+    }
 }
 #endif
