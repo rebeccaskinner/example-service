@@ -91,16 +91,18 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    switch (child_pid = fork()) {
-    case -1:
-        printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
-        break;
-    case 0:
-        printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
-        break;
-    default:
-        exit(0);
-        break;
+    if (!opts.nofork) {
+        switch (child_pid = fork()) {
+        case -1:
+            printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
+            break;
+        case 0:
+            printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
+            break;
+        default:
+            exit(0);
+            break;
+        }
     }
 
     write_pidfile();
@@ -164,6 +166,7 @@ int main(int argc, char **argv) {
 
         }
     }
+
 finish:
     if(opts.log_fd) {
         fflush(opts.log_fd);
@@ -460,10 +463,10 @@ int handle_args(int argc, char** argv, service_opts_t *opts) {
     }
 
     static struct option allowed_opts[] = {
+        {"foreground", no_argument, &foreground_flag, 1},
         {"fail-after", required_argument, 0, 'a'},
         {"exit-with", required_argument, 0, 'b'},
         {"log-to", required_argument, 0, 'c'},
-        {"foreground", no_argument, &foreground_flag, 1},
         {"help", no_argument, 0, 'h'},
         {"reload",no_argument,0,'r'},
         {},
@@ -471,6 +474,9 @@ int handle_args(int argc, char** argv, service_opts_t *opts) {
 
     while (-1 != (c = getopt_long(argc, argv, "a:b:c:hr", allowed_opts, &opt_idx))) {
         switch (c) {
+        case 0:
+            opts->nofork = foreground_flag;
+            break;
         case 'a':
             if (NULL == optarg) {
                 fprintf(stderr, "no time specified for --fail-after\n");
