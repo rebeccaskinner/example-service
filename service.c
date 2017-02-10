@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#define _GNU_SOURCE
 #include <stddef.h>
 #include <errno.h>
 #include <getopt.h>
@@ -30,6 +31,7 @@
 #include <sys/epoll.h>
 #include <stdarg.h>
 #include <time.h>
+#include <linux/limits.h>
 
 const int EPOLL_EVENT_CNT = 10;
 const char PID_PATH[] = "/var/run/example-service.pid";
@@ -68,6 +70,7 @@ int main(int argc, char **argv) {
     int epollfd;
     int num_fds;
     pid_t child_pid;
+    time_t started_at = time(NULL);
 
     struct epoll_event events[EPOLL_EVENT_CNT];
     if (-1 == handle_args(argc, argv, &opts)) {
@@ -82,6 +85,27 @@ int main(int argc, char **argv) {
     if (opts.reload_config) {
         return handle_reload(&opts);
     }
+
+    if(!check_pidfile()) {
+        printlog(stderr, "process already running\n");
+        return -1;
+    }
+
+    switch (child_pid = fork()) {
+    case -1:
+        printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
+        break;
+    case 0:
+        printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
+        break;
+    default:
+        exit(0);
+        break;
+    }
+
+    write_pidfile();
+
+    printlog(opts.log_fd, "Process started at %lu\n", started_at);
 
     listen_fd = open_uds_socket_srv(SRV_SOCK_PATH, opts.log_fd);
 
@@ -109,19 +133,10 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    switch (child_pid = fork()) {
-    case -1:
-        printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
-        break;
-    case 0:
-        printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
-        break;
-    default:
-        exit(0);
-        break;
+    if (NULL != opts.timeout_after) {
+        printlog(opts.log_fd, "timing out run after %lu seconds\n", *opts.timeout_after);
+        alarm(*opts.timeout_after);
     }
-
-    write_pidfile();
 
     for(;;) {
         if(-1 == (num_fds = epoll_wait(epollfd, events, EPOLL_EVENT_CNT, -1))) {
@@ -133,7 +148,18 @@ int main(int argc, char **argv) {
             }
 
             if (events[i].data.fd == signal_fd) {
-                if(handle_signal_fd(signal_fd, opts.log_fd)) { goto finish; }
+                int this_signal = handle_signal_fd(signal_fd, opts.log_fd);
+                if (-1 == this_signal) {
+                    goto finish;
+                }
+                if (SIGALRM == this_signal && NULL != opts.timeout_after) {
+                    if (*opts.timeout_after <= (time(NULL) - started_at)) {
+                        printlog(opts.log_fd, "timeout alarm signaled, exiting\n");
+                        goto finish;
+                    } else {
+                        alarm(1);
+                    }
+                }
             }
 
         }
@@ -146,6 +172,9 @@ finish:
     if(0 < epollfd) { close(epollfd); }
     if(0 < signal_fd) { close(signal_fd); }
     if(0 < listen_fd) { close(listen_fd); }
+    if (NULL != opts.exit_with) {
+        exit(*opts.exit_with);
+    }
     return 0;
 }
 
@@ -172,6 +201,7 @@ int handle_socket_fd(int socketfd, FILE* logfile) {
     if (!strcmp("EXIT", msg_buffer)) {
         return -1;
     }
+
     return 0;
 }
 
@@ -209,7 +239,7 @@ int handle_signal_fd(int signalfd, FILE* logfile) {
         printlog(logfile, "received SIGPIPE\n");
         break;
     case SIGALRM:
-        printlog(logfile, "received SIGHALRM\n");
+        printlog(logfile, "received SIGALRM\n");
         break;
     case SIGTERM:
         printlog(logfile, "received SIGTERM\n");
@@ -226,7 +256,7 @@ int handle_signal_fd(int signalfd, FILE* logfile) {
         printlog(logfile, "received unknown signal: %d\n", fdsi.ssi_signo);
         break;
     }
-    return 0;
+    return fdsi.ssi_signo;
 }
 
 int add_fd_to_epoll(int epollfd, int fd) {
@@ -333,28 +363,49 @@ error:
 //       /proc/<pidfile>/exe is not the same binary as /proc/self/exe
 int check_pidfile() {
     struct stat st;
-    FILE* f;
+    int fd = -1;
     char* pidfile_contents = 0;
+    char exe_path [PATH_MAX] = {0};
+    char my_path [PATH_MAX] = {0};
+    char real_exe_path [PATH_MAX] = {0};
     int rv = -1;
 
     if (-1 == stat(PID_PATH, &st)) {
         rv = 0;
+        printlog(stderr, "no pidfile at %s\n", PID_PATH);
         goto cleanup;
     }
 
     pidfile_contents = malloc(st.st_size);
-    if (NULL == (f = fopen(PID_PATH, "r"))) {
+    if (-1 == (fd = open(PID_PATH, O_RDONLY))) {
         printlog(stderr, "Error opening pidfile: %s\n", strerror(errno));
         goto cleanup;
     }
 
-cleanup:
-    if (NULL != f) {
-        fclose(f);
+    if(!read(fd, pidfile_contents, st.st_size)) {
+        printlog(stderr, "Error reading pidfile: %s\n", strerror(errno));
+        goto cleanup;
     }
 
-    if (NULL != pidfile_contents) {
+
+    if(-1 == readlink("/proc/self/exe", my_path, sizeof(my_path) - 1)) {
+        printlog(stderr, "unable to read link for /proc/self/exe: %s\n", strerror(errno));
+        goto cleanup;
     }
+
+    snprintf(exe_path, sizeof(exe_path), "/proc/%s/exe", pidfile_contents);
+    if(-1 == readlink(exe_path, real_exe_path, sizeof(real_exe_path) - 1)) {
+        if (errno != ENOENT) {
+            printlog(stderr, "unable to get full path of %s: %s\n", exe_path, strerror(errno));
+            goto cleanup;
+        }
+    }
+
+    rv = strcmp(my_path, real_exe_path);
+
+cleanup:
+    if (0 < fd) {close(fd);}
+    if (NULL != pidfile_contents) {free(pidfile_contents);}
     return rv;
 }
 
