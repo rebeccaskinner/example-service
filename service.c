@@ -50,11 +50,6 @@ int handle_socket_fd(int socketfd, FILE* logfile);
 int handle_signal_fd(int signalfd, FILE* logfile);
 void printlog(FILE* logfile, const char* fmt, ...);
 void write_pidfile();
-
-#ifdef DEBUG
-void show_service_opts(service_opts_t* s);
-#endif
-
 void showHelp();
 
 struct service_opts {
@@ -84,15 +79,13 @@ int main(int argc, char **argv) {
         opts.log_fd = stderr;
     }
 
-    #ifdef DEBUG
-    show_service_opts(&opts);
-    #endif
-
     if (opts.reload_config) {
         return handle_reload(&opts);
     }
 
-    if (-1 == (listen_fd = open_uds_socket_srv(SRV_SOCK_PATH, opts.log_fd))) {
+    listen_fd = open_uds_socket_srv(SRV_SOCK_PATH, opts.log_fd);
+
+    if (-1 == listen_fd) {
         printlog(opts.log_fd, "cannot open unix socket at '%s'\n", SRV_SOCK_PATH);
         return -1;
     }
@@ -164,16 +157,21 @@ void printlog(FILE* logfile, const char* fmt, ...) {
     va_start (ap, fmt);
     fprintf(logfile, "[%lu] ", time(NULL));
     vfprintf(logfile, fmt, ap);
-    #ifdef DEBUG
-    if (logfile != stderr && logfile != stdout) {
-        fprintf(stderr, "[%lu] ", time(NULL));
-        vfprintf(stderr, fmt, ap);
-    }
-    #endif
     va_end (ap);
 }
 
 int handle_socket_fd(int socketfd, FILE* logfile) {
+    ssize_t recv_bytes = 0;
+    char msg_buffer[128] = {'a'};
+    msg_buffer[3] = '\0';
+    if(-1 == (recv_bytes = recvfrom(socketfd, msg_buffer, 128, 0, NULL, NULL))) {
+        printlog(logfile, "error reading from socket: %s\n", strerror(errno));
+        return -1;
+    }
+    printlog(logfile, "received a %d-byte socket message: %s\n", recv_bytes, msg_buffer);
+    if (!strcmp("EXIT", msg_buffer)) {
+        return -1;
+    }
     return 0;
 }
 
@@ -271,7 +269,7 @@ int get_signal_fd(FILE* logfd) {
     return signal_fd;
 }
 
-int handle_reload(__attribute__((unused)) service_opts_t* opts) {
+int handle_reload(__attribute__((unused)) __attribute__((unused))service_opts_t* opts) {
     return 0;
 }
 
@@ -294,6 +292,8 @@ int open_uds_socket_srv(const char* path, FILE* logfd) {
         return -1;
     }
 
+    printlog(logfd, "socket(PF_LOCAL, SOCK_DGRAM) returned %d\n", fd);
+
     memset(&sa, 0, sizeof(struct sockaddr_un));
     sa.sun_family = AF_LOCAL;
     strncpy(sa.sun_path, path, sizeof(sa.sun_path));
@@ -305,7 +305,8 @@ int open_uds_socket_srv(const char* path, FILE* logfd) {
         goto error;
     }
 
-    return 0;
+    printlog(logfd, "open_uds_socket_srv: returning %d\n", fd);
+    return fd;
 error:
     if(fd > 0) {
         close(fd);
@@ -358,11 +359,19 @@ cleanup:
 }
 
 void write_pidfile() {
+    FILE* f;
     if(-1 == unlink(PID_PATH)) {
         if (ENOENT != errno) {
             exit(-1);
         }
     }
+    if(NULL == (f = fopen(PID_PATH, "w"))) {
+        fprintf(stderr, "unable to create PIDfile\n");
+        exit(-1);
+    }
+    fprintf(f, "%d", getpid());
+    fflush(f);
+    fclose(f);
 }
 
 void showHelp() {
@@ -490,34 +499,3 @@ FILE* open_logfile(char* path) {
 
     return fopen(path, "a+");
 }
-
-#ifdef DEBUG
-void show_service_opts(service_opts_t* opts) {
-    if (!opts) {
-        printf("configured options: NULL\n");
-        return;
-    }
-    if (opts->reload_config) {
-        printf("reloading config\n");
-        return;
-    }
-    printf("configured options:\n");
-    printf("\t Timeout after: ");
-    if (opts->timeout_after) {
-        printf("%ld\n", *(opts->timeout_after));
-    } else {printf("NULL\n");}
-    printf("\t Exit With: ");
-    if (opts->exit_with) {
-        printf("%d\n", *(opts->exit_with));
-    } else { printf("NULL\n"); }
-    printf("\t Logging to: ");
-    if (opts->log_to && opts->log_fd) {
-        printf("%s (%d)\n", opts->log_to, fileno(opts->log_fd));
-    } else { printf("unknown\n"); }
-    if (opts->nofork) {
-        printf("running in foreground\n");
-    } else {
-        printf("running in background\n");
-    }
-}
-#endif
