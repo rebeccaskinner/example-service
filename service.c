@@ -302,7 +302,34 @@ int get_signal_fd(FILE* logfd) {
     return signal_fd;
 }
 
-int handle_reload(__attribute__((unused)) __attribute__((unused))service_opts_t* opts) {
+int handle_reload(__attribute__((unused)) service_opts_t* opts) {
+    int fd;
+    socklen_t size;
+    struct sockaddr_un sa;
+
+    static const char msg[] = "RELOAD";
+
+    if(check_pidfile()) {
+        printlog(stderr, "cannot reload process, not running\n");
+        return -1;
+    }
+
+    if(-1 == (fd = socket(PF_LOCAL, SOCK_DGRAM, 0))) {
+        printlog(stderr, "failed to open socket: %s\n", strerror(errno));
+    }
+
+    memset(&sa, 0, sizeof(struct sockaddr_un));
+    sa.sun_family = AF_LOCAL;
+    strncpy(sa.sun_path, SRV_SOCK_PATH, sizeof(sa.sun_path));
+    sa.sun_path[sizeof(sa.sun_path) - 1] = '\0';
+
+    size = (offsetof (struct sockaddr_un, sun_path)) + strlen(sa.sun_path);
+
+    if(-1 == sendto(fd, msg,  sizeof(msg), 0, (struct sockaddr*)&sa, size)) {
+        printlog(stderr, "failed to send message to socket: %s\n", strerror(errno));
+    }
+
+    close(fd);
     return 0;
 }
 
@@ -318,7 +345,6 @@ int open_uds_socket_srv(const char* path, FILE* logfd) {
             return -1;
         }
     }
-
 
     if (-1 == (fd = socket(PF_LOCAL, SOCK_DGRAM, 0))) {
         printlog(logfd, "error getting socket: %s\n", strerror(errno));
@@ -429,26 +455,29 @@ void write_pidfile() {
 }
 
 void showHelp() {
-    fprintf(stderr, "example-service: a basic systemd-aware service that acts as an example and testbed.\n");
-    fprintf(stderr, "Usage: service [options]\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --fail-after <time> \t The service will fail after TIME seconds.  \n");
-    fprintf(stderr, "\t                     \t if an exit code was specified with --exit-with, then\n");
-    fprintf(stderr, "\t                     \t that code will be used, otherwise exit with EXIT_SUCCESS\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --exit-with <int>   \t The service will exit with this error code, if specified.  If\n");
-    fprintf(stderr, "\t                     \t --exit-with is not specified, exit with EXIT_SUCCESS\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --log-to <file>     \t Specifies the path to the file that log data will be written to.\n");
-    fprintf(stderr, "\t                     \t if this is not specified, logs will be written to \n");
-    fprintf(stderr, "\t                     \t /var/log/example-service/service.log\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --foreground        \t If --foreground is set the do not daemonize\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --reload            \t Tell running instance of the service to reload it's config\n");
-    fprintf(stderr,"\n");
-    fprintf(stderr, "\t --help              \t show this help message and exit\n");
+    static const char* helpstr =
+    "example-service: a basic systemd-aware service that acts as an example and testbed.\n"
+    "Usage: service [options]\n"
+    "Options:\n"
+    "\n"
+    "\t --fail-after <time> \t The service will fail after TIME seconds.  \n"
+    "\t                     \t if an exit code was specified with --exit-with, then\n"
+    "\t                     \t that code will be used, otherwise exit with EXIT_SUCCESS\n"
+    "\n"
+    "\t --exit-with <int>   \t The service will exit with this error code, if specified.  If\n"
+    "\t                     \t --exit-with is not specified, exit with EXIT_SUCCESS\n"
+    "\n"
+    "\t --log-to <file>     \t Specifies the path to the file that log data will be written to.\n"
+    "\t                     \t if this is not specified, logs will be written to \n"
+    "\t                     \t /var/log/example-service/service.log\n"
+    "\n"
+    "\t --foreground        \t If --foreground is set the do not daemonize\n"
+    "\n"
+    "\t --reload            \t Tell running instance of the service to reload it's config\n"
+    "\n"
+    "\t --help              \t show this help message and exit\n";
+
+    fprintf(stderr, "%s", helpstr);
 }
 
 int handle_args(int argc, char** argv, service_opts_t *opts) {
