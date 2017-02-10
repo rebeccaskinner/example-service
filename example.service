@@ -1,0 +1,17 @@
+[Unit]
+Description=A well behaved daemon that does nothing
+After=network.target auditd.service
+
+[Service]
+ExecStart=/usr/sbin/example-service --log-to /var/log/example-service.log
+ExecReload=/usr/bin/example-service --reload
+PIDFile=/var/run/example-service.pid
+KillSignal=SIGINT
+KillMode=process
+Restart=on-failure
+RestartPreventExitStatus=255
+Type=notify
+
+[Install]
+WantedBy=multi-user.target
+Alias=sshd.service
