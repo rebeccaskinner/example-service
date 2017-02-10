@@ -32,6 +32,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <linux/limits.h>
+#include <systemd/sd-daemon.h>
 
 const int EPOLL_EVENT_CNT = 10;
 const char PID_PATH[] = "/var/run/example-service.pid";
@@ -140,6 +141,8 @@ int main(int argc, char **argv) {
         alarm(*opts.timeout_after);
     }
 
+    sd_notify(0, "READY=1");
+
     for(;;) {
         if(-1 == (num_fds = epoll_wait(epollfd, events, EPOLL_EVENT_CNT, -1))) {
             printlog(opts.log_fd, "epoll_wait error: %s\n", strerror(errno));
@@ -168,6 +171,7 @@ int main(int argc, char **argv) {
     }
 
 finish:
+    sd_notify(0, "STOPPING=1");
     if(opts.log_fd) {
         fflush(opts.log_fd);
         fclose(opts.log_fd);
@@ -200,9 +204,19 @@ int handle_socket_fd(int socketfd, FILE* logfile) {
         printlog(logfile, "error reading from socket: %s\n", strerror(errno));
         return -1;
     }
-    printlog(logfile, "received a %d-byte socket message: %s\n", recv_bytes, msg_buffer);
+
     if (!strcmp("EXIT", msg_buffer)) {
         return -1;
+    }
+
+    if (!strcmp("RELOAD", msg_buffer)) {
+        sd_notify(0, "RELOADING=1\n");
+    }
+
+    printlog(logfile, "received a %d-byte socket message: %s\n", recv_bytes, msg_buffer);
+
+    if(!strcmp("RELOAD", msg_buffer)) {
+        sd_notify(0, "READY=1");
     }
 
     return 0;
@@ -318,6 +332,7 @@ int handle_reload(__attribute__((unused)) service_opts_t* opts) {
         printlog(stderr, "failed to open socket: %s\n", strerror(errno));
     }
 
+
     memset(&sa, 0, sizeof(struct sockaddr_un));
     sa.sun_family = AF_LOCAL;
     strncpy(sa.sun_path, SRV_SOCK_PATH, sizeof(sa.sun_path));
@@ -338,6 +353,17 @@ int open_uds_socket_srv(const char* path, FILE* logfd) {
     int fd;
     socklen_t size;
     struct sockaddr_un sa;
+
+    printlog(logfd, "%d sockets inherited from systemd\n", sd_listen_fds(0));
+    if (1 == sd_listen_fds(0)) {
+        if(sd_is_socket(SD_LISTEN_FDS_START,
+                        PF_LOCAL,
+                        SOCK_DGRAM,
+                        -1)) {
+            return SD_LISTEN_FDS_START;
+        }
+        printlog(logfd, "received an invalid local socket from systemd");
+    }
 
     if (unlink(path)) {
         if (ENOENT != errno) {
@@ -364,8 +390,13 @@ int open_uds_socket_srv(const char* path, FILE* logfd) {
         goto error;
     }
 
+    if(-1 == chmod(SRV_SOCK_PATH, S_IRUSR | S_IWUSR | S_IWGRP | S_IWOTH)) {
+        printlog(stderr, "failed to set ownership on socket: %s\n", strerror(errno));
+    }
+
     printlog(logfd, "open_uds_socket_srv: returning %d\n", fd);
     return fd;
+
 error:
     if(fd > 0) {
         close(fd);
