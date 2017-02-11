@@ -4,3 +4,6 @@ Description=Example service local unix socket
 [Socket]
 ListenDatagram=/tmp/example-service.socket
 SocketMode=0622
+
+[Install]
+WantedBy=sockets.target

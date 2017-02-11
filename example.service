@@ -1,5 +1,6 @@
 [Unit]
 Description=A well behaved daemon that does nothing
+Requires=example.socket
 After=network.target auditd.service
 
 [Service]

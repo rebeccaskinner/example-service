@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
         return handle_reload(&opts);
     }
 
-    if(!check_pidfile()) {
+    if(check_pidfile()) {
         printlog(stderr, "process already running\n");
         return -1;
     }
