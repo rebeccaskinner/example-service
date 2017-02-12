@@ -92,23 +92,6 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (!opts.nofork) {
-        switch (child_pid = fork()) {
-        case -1:
-            printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
-            break;
-        case 0:
-            printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
-            break;
-        default:
-            exit(0);
-            break;
-        }
-    }
-
-    write_pidfile();
-
-    printlog(opts.log_fd, "Process started at %lu\n", started_at);
 
     listen_fd = open_uds_socket_srv(SRV_SOCK_PATH, opts.log_fd);
 
@@ -140,6 +123,24 @@ int main(int argc, char **argv) {
         printlog(opts.log_fd, "timing out run after %lu seconds\n", *opts.timeout_after);
         alarm(*opts.timeout_after);
     }
+
+    if (!opts.nofork) {
+        switch (child_pid = fork()) {
+        case -1:
+            printlog(opts.log_fd, "error forking child: %s\n", strerror(errno));
+            break;
+        case 0:
+            printlog(opts.log_fd, "child process starting with pid: %d\n", getpid());
+            break;
+        default:
+            exit(0);
+            break;
+        }
+    }
+
+    write_pidfile();
+
+    printlog(opts.log_fd, "Process started at %lu\n", started_at);
 
     sd_notify(0, "READY=1");
 
@@ -442,7 +443,7 @@ int check_pidfile() {
         goto cleanup;
     }
 
-    if(!read(fd, pidfile_contents, st.st_size)) {
+    if(!read(fd, pidfile_contents, st.st_size - 1)) {
         printlog(stderr, "Error reading pidfile: %s\n", strerror(errno));
         goto cleanup;
     }
@@ -473,6 +474,7 @@ void write_pidfile() {
     FILE* f;
     if(-1 == unlink(PID_PATH)) {
         if (ENOENT != errno) {
+            fprintf(stderr, "unable to remove PID path: %s\n", strerror(errno));
             exit(-1);
         }
     }
@@ -480,7 +482,7 @@ void write_pidfile() {
         fprintf(stderr, "unable to create PIDfile\n");
         exit(-1);
     }
-    fprintf(f, "%d", getpid());
+    fprintf(f, "%d\n", getpid());
     fflush(f);
     fclose(f);
 }
