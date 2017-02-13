@@ -15,4 +15,3 @@ Type=notify
 
 [Install]
 WantedBy=multi-user.target
-Alias=sshd.service
