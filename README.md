@@ -17,9 +17,9 @@ done.
 ### Debian & Ubuntu
 
 ```
-$ apt-get install git build-essential libsystemd-dev
-$ git clone https://github.com/rebeccaskinner/example-service.git
-$ cd example-service
-$ make
-$ converge apply --local install-service.hcl # or 'make install'
+user@host:~$ apt-get install git build-essential libsystemd-dev && \
+git clone https://github.com/rebeccaskinner/example-service.git && \
+cd example-service && \
+make && \
+converge apply --local install-service.hcl
 ```
